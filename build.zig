@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const sigbench = b.createModule(.{
+    const sigbench = b.addModule("sigbench", .{
         .root_source_file = b.path("src/sigbench.zig"),
         .target = target,
         .optimize = optimize,
@@ -16,6 +16,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    const package_test = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "test" });
+    package_test.setCwd(b.path("tests/package_consumer"));
+    test_step.dependOn(&package_test.step);
 
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("examples/fib.zig"),
