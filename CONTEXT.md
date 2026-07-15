@@ -36,6 +36,11 @@ _Avoid_: Measurement, datapoint
 The value recorded for a sample. Wall-clock time, CPU cycles, Linux perf counters, and macOS kperf counters are supported measurement kinds.
 _Avoid_: Duration when the value might later come from counters
 
+**Measurement Scope**:
+Explicit start and stop boundary inside a custom timing routine. Setup and teardown stay outside
+the selected measurement kind.
+_Avoid_: Timer when the selected measurement may be a hardware counter
+
 **Resident Set Size**:
 Process memory currently resident in physical memory. Platform APIs name this differently; Windows calls the closest process-level value working set.
 _Avoid_: RSS when discussing Windows API names

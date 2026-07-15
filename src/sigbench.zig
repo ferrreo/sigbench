@@ -17,6 +17,7 @@ pub const CpuCycles = @import("measurement.zig").CpuCycles;
 pub const Config = sampling.Config;
 pub const Measurement = @import("measurement.zig").Measurement;
 pub const MeasurementKind = sampling.MeasurementKind;
+pub const MeasurementScope = api.MeasurementScope;
 pub const LinuxPerf = @import("measurement.zig").LinuxPerf;
 pub const MacosKperf = @import("measurement.zig").MacosKperf;
 pub const ProcessMemory = @import("measurement.zig").ProcessMemory;
@@ -41,10 +42,12 @@ pub const readProcessMemory = @import("measurement.zig").readProcessMemory;
 
 test {
     _ = api;
+    _ = @import("api_scoped_test.zig");
     _ = sampling;
     _ = runner;
     _ = report;
     _ = process_control;
     _ = analysis;
+    _ = @import("x86_cycles.zig");
     _ = @import("measurement.zig");
 }

@@ -186,9 +186,19 @@ This is stricter than Criterion.rs, which uses `Vec` throughout sampling and ana
 Sigbench supports:
 
 - `iter`: default tight loop; one start/end measurement per sample.
-- `iterCustom`: user receives iteration count and returns elapsed nanoseconds.
+- `iterCustom`: legacy wall-clock API; user receives iteration count and returns elapsed
+  nanoseconds.
+- `iterCustomScoped`: user receives iteration count and a `MeasurementScope`; setup and teardown
+  run outside its explicit `start` and `stop` boundary.
 - `iterBatch`: setup outside measured region, routine inside measured region, fixed batch policy.
 - `iterAsync`: executor-backed async routine loop.
+
+`iterCustomScoped` requires exactly one `start` and one `stop`. Missing, repeated, or
+out-of-order boundaries reject the sample even when the benchmark catches the immediate
+error. A callback error closes an active measurement before returning the original callback
+error. `iterCustom` and `finishCustom` remain compatible for wall-clock sampling, but selected
+cycle and perf counters reject them instead of measuring surrounding setup and teardown.
+If a selected counter's `stop` fails, Sigbench returns that error without invoking `stop` again.
 
 Skip `iter_with_large_drop` as a separate concept. Zig has explicit lifetimes and no Rust `Drop`; `iterBatch` covers the real need.
 
@@ -249,6 +259,14 @@ Measurement API requirements:
 - `formatter` handles CLI, HTML, plot, and JSON units.
 
 Cycle and perf measurements must be explicit in benchmark configuration. Wall-clock remains default because it is portable.
+
+On x86 and x86_64, CPU-cycle samples use `LFENCE; RDTSCP; LFENCE` at the start and
+`RDTSCP; LFENCE` at the end, with compiler memory barriers on both boundaries. Preflight checks
+CPUID for TSC, invariant TSC, SSE2/LFENCE, and RDTSCP support before executing those
+instructions. Start and end capture `TSC_AUX`; a changed value rejects the sample with
+`CpuMigrationDetected`. A backwards counter rejects it with `TimestampCounterWentBackwards`.
+Public `CpuCycles.read` uses the serialized start sequence. Windows keeps thread-cycle
+accounting through `QueryThreadCycleTime`.
 
 Perf constraints:
 
@@ -520,6 +538,7 @@ Scope:
 - Benchmark groups and benchmark cases.
 - Parameterized benchmark matrix API with explicit stable parameter IDs and display labels.
 - `Bencher` timing loops: `iter`, `iterCustom`, `iterBatch`.
+- Scoped custom timing through one explicit `MeasurementScope` start/stop pair.
 - Warmup loop with `1, 2, 4, ...` iteration growth.
 - Linear, flat, and auto sampling modes.
 - Structure-of-arrays sample buffers.
@@ -590,6 +609,7 @@ Scope:
 - Permission/setup checks before warmup.
 - Unsupported measurements fail before warmup, never fall back silently.
 - Counter reads inside timed loops allocate nothing.
+- Scoped custom timing excludes setup and teardown for wall, cycle, and perf measurements.
 - Async benchmark API through user-supplied executor adapter.
 - `iterAsync`.
 - Profiling mode: `--profile-time <duration>`.

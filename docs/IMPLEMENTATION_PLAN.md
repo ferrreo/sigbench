@@ -37,6 +37,7 @@ Tasks:
 - Implement parameter matrix API with stable parameter IDs and display labels.
 - Implement `Bencher.iter`.
 - Implement `Bencher.iterCustom`.
+- Implement `Bencher.iterCustomScoped` with one explicit measurement scope.
 - Implement `Bencher.iterBatch`.
 - Implement warmup with `1, 2, 4, ...` iteration growth.
 - Implement linear, flat, and auto sampling modes.
@@ -100,7 +101,9 @@ Goal: non-wall-clock measurements and runtime modes.
 Tasks:
 
 - Implement measurement interface: `start`, `end`, `zero`, `add`, `toF64`, formatter.
+- Route bencher timing boundaries through the selected measurement driver.
 - Implement CPU cycles measurement.
+- Serialize x86 cycle boundaries; require invariant TSC; reject migration and backwards TSC.
 - Implement Linux perf counters through `perf_event_open`.
 - Implement macOS kperf counters.
 - Implement Windows cycles through `QueryThreadCycleTime` or `QueryProcessCycleTime`.
@@ -115,6 +118,7 @@ Tasks:
 - Capture allocator counters exactly per sample.
 - Fail unsupported selected measurements before warmup.
 - Ensure counter setup allocates before warmup and reads allocate nothing in timed loops.
+- Reject unscoped custom wall-clock timings when cycle or perf measurement is selected.
 - Implement async executor adapter API.
 - Implement `iterAsync`.
 - Implement `--profile-time`.
@@ -132,6 +136,8 @@ Verification:
 - Windows cycles/memory tests run where supported.
 - Allocator counter tests cover alloc/free/resize/live/peak accounting and wrapper transparency.
 - Async test proves executor is called and measured.
+- Scope tests cover setup/teardown exclusion, missing/repeated boundaries, caught violations,
+  and callback-error cleanup.
 - Profiling test proves hooks fire exactly once per selected case and analysis/report saving are skipped.
 - Isolated process mode preserves result schema.
 - Priority/affinity are opt-in and reported.

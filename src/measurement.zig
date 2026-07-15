@@ -1,8 +1,9 @@
 const std = @import("std");
 const api = @import("api.zig");
 const builtin = @import("builtin");
+const x86_cycles = @import("x86_cycles.zig");
 
-pub const MeasurementValue = u64;
+pub const MeasurementValue = api.MeasurementValue;
 
 pub const Measurement = struct {
     ctx: *anyopaque,
@@ -70,6 +71,10 @@ pub const WallClock = struct {
 };
 
 pub const CpuCycles = struct {
+    x86_support_checked: bool = false,
+    x86_measurement_started: bool = false,
+    x86_start_auxiliary: u32 = 0,
+
     pub fn measurement(self: *CpuCycles) Measurement {
         return .{
             .ctx = self,
@@ -83,22 +88,55 @@ pub const CpuCycles = struct {
     }
 
     pub fn read() !u64 {
-        if (builtin.os.tag == .windows) return readWindowsThreadCycles();
+        var cycles: CpuCycles = .{};
+        return cycles.readStart();
+    }
+
+    fn start(ctx: *anyopaque) !MeasurementValue {
+        const self: *CpuCycles = @ptrCast(@alignCast(ctx));
+        return self.readStart();
+    }
+
+    fn end(ctx: *anyopaque, started: MeasurementValue) !MeasurementValue {
+        const self: *CpuCycles = @ptrCast(@alignCast(ctx));
+        if (builtin.os.tag == .windows) {
+            const finished = try readWindowsThreadCycles();
+            return finished - started;
+        }
         return switch (builtin.cpu.arch) {
-            .x86, .x86_64 => readX86Tsc(),
+            .x86, .x86_64 => self.endX86(started),
             else => error.UnsupportedMeasurement,
         };
     }
 
-    fn start(ctx: *anyopaque) !MeasurementValue {
-        _ = ctx;
-        return try read();
+    fn readStart(self: *CpuCycles) !u64 {
+        if (builtin.os.tag == .windows) return readWindowsThreadCycles();
+        return switch (builtin.cpu.arch) {
+            .x86, .x86_64 => {
+                if (!self.x86_support_checked) {
+                    try x86_cycles.ensureSupported();
+                    self.x86_support_checked = true;
+                }
+                const timestamp = x86_cycles.readStart();
+                self.x86_measurement_started = true;
+                self.x86_start_auxiliary = timestamp.auxiliary;
+                return timestamp.cycles;
+            },
+            else => error.UnsupportedMeasurement,
+        };
     }
 
-    fn end(ctx: *anyopaque, started: MeasurementValue) !MeasurementValue {
-        _ = ctx;
-        const finished = try read();
-        return finished - started;
+    fn endX86(self: *CpuCycles, started: u64) !u64 {
+        if (!self.x86_support_checked or !self.x86_measurement_started) {
+            return error.UnsupportedMeasurement;
+        }
+        const started_timestamp: x86_cycles.Timestamp = .{
+            .cycles = started,
+            .auxiliary = self.x86_start_auxiliary,
+        };
+        const finished = x86_cycles.readEnd();
+        self.x86_measurement_started = false;
+        return x86_cycles.elapsed(started_timestamp, finished);
     }
 
     fn zero(ctx: *anyopaque) MeasurementValue {
@@ -420,16 +458,6 @@ pub fn preflight(kind: anytype, allocator: std.mem.Allocator, io: std.Io) !void 
         .process_memory => _ = try readProcessMemory(allocator, io),
         .allocator_counters => {},
     }
-}
-
-fn readX86Tsc() u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [lo] "={eax}" (lo),
-          [hi] "={edx}" (hi),
-    );
-    return (@as(u64, hi) << 32) | lo;
 }
 
 fn readWindowsThreadCycles() !u64 {

@@ -1,6 +1,6 @@
 .{
     .name = .sigbench,
-    .version = "0.0.2",
+    .version = "0.0.3",
     .fingerprint = 0xecd86bf6a0810a9c, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

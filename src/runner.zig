@@ -369,6 +369,7 @@ fn runProfileCase(init: std.process.Init, group: api.BenchmarkGroup, case: api.B
     while (api.nowNs() - start < profile_ns) {
         var b: api.Bencher = .{ .iterations = 1 };
         try case.run(&b);
+        if (b.timing_error) |err| return err;
     }
     if (!silent(cli.config)) std.debug.print("{s}/{s} profiled for {} ns\n", .{ group.name, case.name, profile_ns });
     if (isJson(cli.config)) try jsonEvent(init, "benchmark_end", group.id, case.id);

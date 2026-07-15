@@ -99,6 +99,10 @@ pub fn warmup(allocator: std.mem.Allocator, case: api.BenchmarkCase, target_ns: 
         var counting = measurement.CountingAllocator.init(allocator);
         if (kind == .allocator_counters) b.allocator = counting.allocator();
         try case.run(&b);
+        if (b.timing_error) |err| return err;
+        if (requiresExternalTiming(kind) and b.unscoped_custom_timing) {
+            return error.ExternalMeasurementRequiresScopedCustomTiming;
+        }
         if (requiresTimingLoop(kind) and !b.measured) return error.BenchmarkDidNotMeasure;
         total_iterations += iterations;
         total_elapsed += @max(@as(u64, 1), b.elapsed_ns);
@@ -141,6 +145,7 @@ pub fn collect(
     defer if (linux_perf) |perf| perf.close();
     var macos_kperf = if (kind == .macos_kperf) try measurement.MacosKperf.open() else null;
     defer if (macos_kperf) |kperf| kperf.close();
+    var cpu_cycles: measurement.CpuCycles = .{};
 
     for (counts, 0..) |iterations, i| {
         var b: api.Bencher = .{
@@ -148,8 +153,7 @@ pub fn collect(
             .external_timing = kind == .cpu_cycles or kind == .linux_perf or kind == .macos_kperf,
         };
         if (kind == .cpu_cycles) {
-            var cycles: measurement.CpuCycles = .{};
-            samples.elapsed_ns[i] = try collectMeasured(case, &b, cycles.measurement());
+            samples.elapsed_ns[i] = try collectMeasured(case, &b, cpu_cycles.measurement());
         } else if (kind == .linux_perf) {
             samples.elapsed_ns[i] = try collectMeasured(case, &b, linux_perf.?.measurement());
         } else if (kind == .macos_kperf) {
@@ -157,6 +161,7 @@ pub fn collect(
         } else if (kind == .process_memory) {
             const before = try measurement.readProcessMemory(allocator, io);
             try case.run(&b);
+            if (b.timing_error) |err| return err;
             const after = try measurement.readProcessMemory(allocator, io);
             samples.process_memory[i] = .{
                 .rss_bytes = delta(after.rss_bytes, before.rss_bytes),
@@ -169,10 +174,12 @@ pub fn collect(
             var counting = measurement.CountingAllocator.init(allocator);
             b.allocator = counting.allocator();
             try case.run(&b);
+            if (b.timing_error) |err| return err;
             samples.elapsed_ns[i] = @floatFromInt(counting.counters.allocations);
             samples.allocator_counters[i] = counting.counters;
         } else {
             try case.run(&b);
+            if (b.timing_error) |err| return err;
             if (!b.measured) return error.BenchmarkDidNotMeasure;
             samples.elapsed_ns[i] = @floatFromInt(b.elapsed_ns);
         }
@@ -183,11 +190,18 @@ pub fn collect(
 }
 
 fn collectMeasured(case: api.BenchmarkCase, b: *api.Bencher, m: measurement.Measurement) !f64 {
-    const start = try m.start(m.ctx);
-    errdefer _ = m.end(m.ctx, start) catch {};
+    b.measurement_driver = .{
+        .ctx = m.ctx,
+        .start = m.start,
+        .end = m.end,
+        .zero = m.zero,
+        .add = m.add,
+    };
     try case.run(b);
+    if (b.timing_error) |err| return err;
+    if (b.unscoped_custom_timing) return error.ExternalMeasurementRequiresScopedCustomTiming;
     if (!b.measured) return error.BenchmarkDidNotMeasure;
-    return m.toF64(m.ctx, try m.end(m.ctx, start));
+    return m.toF64(m.ctx, b.elapsed_ns);
 }
 
 fn delta(after: u64, before: u64) f64 {
@@ -198,6 +212,13 @@ fn requiresTimingLoop(kind: MeasurementKind) bool {
     return switch (kind) {
         .wall_time, .cpu_cycles, .linux_perf, .macos_kperf => true,
         .process_memory, .allocator_counters => false,
+    };
+}
+
+fn requiresExternalTiming(kind: MeasurementKind) bool {
+    return switch (kind) {
+        .cpu_cycles, .linux_perf, .macos_kperf => true,
+        .wall_time, .process_memory, .allocator_counters => false,
     };
 }
 
@@ -340,21 +361,35 @@ test "wall-time collection rejects unmeasured benchmark" {
     try std.testing.expectError(error.BenchmarkDidNotMeasure, collect(std.testing.allocator, std.testing.io, case, samples, &iterations, .wall_time));
 }
 
-test "external measurement ends when benchmark fails" {
+test "external measurement honors scoped custom boundaries" {
     const S = struct {
-        var ended = false;
+        var now: u64 = 0;
+        var starts: u64 = 0;
+        var ends: u64 = 0;
 
-        fn bench(_: *api.Bencher) !void {
-            return error.IntentionalFailure;
+        fn bench(b: *api.Bencher) !void {
+            now += 100;
+            try b.iterCustomScoped(run);
+            now += 200;
+        }
+
+        fn run(iterations: u64, scope: *api.MeasurementScope) !void {
+            now += 300;
+            try scope.start();
+            var iteration: u64 = 0;
+            while (iteration < iterations) : (iteration += 1) now += 7;
+            try scope.stop();
+            now += 400;
         }
 
         fn start(_: *anyopaque) !measurement.MeasurementValue {
-            return 1;
+            starts += 1;
+            return now;
         }
 
-        fn end(_: *anyopaque, _: measurement.MeasurementValue) !measurement.MeasurementValue {
-            ended = true;
-            return 0;
+        fn end(_: *anyopaque, started: measurement.MeasurementValue) !measurement.MeasurementValue {
+            ends += 1;
+            return now - started;
         }
 
         fn zero(_: *anyopaque) measurement.MeasurementValue {
@@ -374,9 +409,9 @@ test "external measurement ends when benchmark fails" {
         }
     };
     var ctx: u8 = 0;
-    var b: api.Bencher = .{ .external_timing = true };
-    const case = comptime api.benchWithId("fail", "fail", S.bench);
-    try std.testing.expectError(error.IntentionalFailure, collectMeasured(case, &b, .{
+    var b: api.Bencher = .{ .iterations = 3, .external_timing = true };
+    const case = comptime api.benchWithId("scoped", "scoped", S.bench);
+    const elapsed = try collectMeasured(case, &b, .{
         .ctx = &ctx,
         .start = S.start,
         .end = S.end,
@@ -384,6 +419,61 @@ test "external measurement ends when benchmark fails" {
         .add = S.add,
         .toF64 = S.toF64,
         .format = S.format,
-    }));
-    try std.testing.expect(S.ended);
+    });
+    try std.testing.expectEqual(@as(f64, 21), elapsed);
+    try std.testing.expectEqual(@as(u64, 1), S.starts);
+    try std.testing.expectEqual(@as(u64, 1), S.ends);
+}
+
+test "external measurement rejects legacy custom timing" {
+    const S = struct {
+        fn elapsed(iterations: u64) u64 {
+            return iterations;
+        }
+
+        fn bench(b: *api.Bencher) void {
+            b.iterCustom(elapsed);
+        }
+    };
+    var wall: measurement.WallClock = .{};
+    var b: api.Bencher = .{ .external_timing = true };
+    const case = comptime api.benchWithId("legacy", "legacy", S.bench);
+    try std.testing.expectError(
+        error.ExternalMeasurementRequiresScopedCustomTiming,
+        collectMeasured(case, &b, wall.measurement()),
+    );
+    try std.testing.expectError(
+        error.ExternalMeasurementRequiresScopedCustomTiming,
+        warmup(std.testing.allocator, case, 1, .cpu_cycles),
+    );
+}
+
+test "collection rejects caught scope protocol error" {
+    const S = struct {
+        fn scoped(_: u64, _: *api.MeasurementScope) !void {}
+
+        fn bench(b: *api.Bencher) void {
+            b.iterCustomScoped(scoped) catch {};
+        }
+    };
+    const case = comptime api.benchWithId("caught", "caught", S.bench);
+    var iterations = [_]u64{1};
+    var elapsed = [_]f64{0};
+    var avg = [_]f64{0};
+    const samples: SampleSet = .{
+        .iterations = &iterations,
+        .elapsed_ns = &elapsed,
+        .avg_ns = &avg,
+    };
+    try std.testing.expectError(
+        error.MeasurementScopeNotStarted,
+        collect(
+            std.testing.allocator,
+            std.testing.io,
+            case,
+            samples,
+            &iterations,
+            .wall_time,
+        ),
+    );
 }

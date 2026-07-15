@@ -29,6 +29,100 @@ pub const AsyncExecutor = struct {
     run: *const fn (*anyopaque, *const fn () void) void,
 };
 
+pub const MeasurementValue = u64;
+
+pub const MeasurementDriver = struct {
+    ctx: *anyopaque,
+    start: *const fn (*anyopaque) anyerror!MeasurementValue,
+    end: *const fn (*anyopaque, MeasurementValue) anyerror!MeasurementValue,
+    zero: *const fn (*anyopaque) MeasurementValue,
+    add: *const fn (*anyopaque, MeasurementValue, MeasurementValue) MeasurementValue,
+};
+
+pub const MeasurementScope = struct {
+    driver: MeasurementDriver,
+    started_value: MeasurementValue = 0,
+    elapsed: MeasurementValue = 0,
+    started: bool = false,
+    stopped: bool = false,
+    active: bool = false,
+    violation: ?Violation = null,
+    driver_error: ?anyerror = null,
+
+    const Violation = enum {
+        started_twice,
+        stopped_before_start,
+        stopped_twice,
+    };
+
+    pub fn start(self: *MeasurementScope) !void {
+        if (self.started) return self.reject(.started_twice);
+        self.started = true;
+        self.started_value = self.driver.start(self.driver.ctx) catch |err| {
+            self.driver_error = err;
+            return err;
+        };
+        self.active = true;
+    }
+
+    pub fn stop(self: *MeasurementScope) !void {
+        if (!self.started) return self.reject(.stopped_before_start);
+        if (self.stopped) return self.reject(.stopped_twice);
+        self.stopped = true;
+        if (self.driver_error) |err| return err;
+        self.active = false;
+        self.elapsed = self.driver.end(self.driver.ctx, self.started_value) catch |err| {
+            self.driver_error = err;
+            return err;
+        };
+    }
+
+    fn finish(self: *MeasurementScope) !MeasurementValue {
+        if (self.violation) |violation| {
+            self.closeActive();
+            return violationError(violation);
+        }
+        if (self.driver_error) |err| {
+            self.closeActive();
+            return err;
+        }
+        if (!self.started) return error.MeasurementScopeNotStarted;
+        if (!self.stopped) {
+            self.closeActive();
+            return error.MeasurementScopeNotStopped;
+        }
+        return self.elapsed;
+    }
+
+    fn closeActive(self: *MeasurementScope) void {
+        if (!self.active) return;
+        self.active = false;
+        self.stopped = true;
+        self.elapsed = self.driver.end(self.driver.ctx, self.started_value) catch |err| {
+            self.driver_error = err;
+            return;
+        };
+    }
+
+    fn reject(self: *MeasurementScope, violation: Violation) anyerror {
+        if (self.violation == null) self.violation = violation;
+        return violationError(violation);
+    }
+
+    fn protocolError(self: MeasurementScope) ?anyerror {
+        if (self.violation) |violation| return violationError(violation);
+        return null;
+    }
+
+    fn violationError(violation: Violation) anyerror {
+        return switch (violation) {
+            .started_twice => error.MeasurementScopeStartedTwice,
+            .stopped_before_start => error.MeasurementScopeStoppedBeforeStart,
+            .stopped_twice => error.MeasurementScopeStoppedTwice,
+        };
+    }
+};
+
 pub const Profiler = struct {
     ctx: ?*anyopaque = null,
     startFn: ?*const fn (?*anyopaque, []const u8, []const u8) void = null,
@@ -50,35 +144,72 @@ pub const Bencher = struct {
     used_async: bool = false,
     measured: bool = false,
     external_timing: bool = false,
+    measurement_driver: ?MeasurementDriver = null,
+    timing_error: ?anyerror = null,
+    unscoped_custom_timing: bool = false,
 
     pub fn benchmarkAllocator(self: *Bencher) std.mem.Allocator {
         return self.allocator.?;
     }
 
     pub fn iter(self: *Bencher, routine: *const fn () void) void {
-        const start = if (self.external_timing) 0 else nowNs();
+        const start = self.startMeasurement() orelse return;
         var i: u64 = 0;
         while (i < self.iterations) : (i += 1) routine();
-        self.elapsed_ns = if (self.external_timing) 0 else nowNs() - start;
+        self.elapsed_ns = self.endMeasurement(start) orelse return;
         self.measured = true;
     }
 
     pub fn iterCustom(self: *Bencher, routine: *const fn (u64) u64) void {
         self.elapsed_ns = routine(self.iterations);
         self.measured = true;
+        self.unscoped_custom_timing = true;
+        if (self.external_timing) {
+            self.recordTimingError(error.ExternalMeasurementRequiresScopedCustomTiming);
+        }
+    }
+
+    pub fn iterCustomScoped(
+        self: *Bencher,
+        routine: *const fn (u64, *MeasurementScope) anyerror!void,
+    ) !void {
+        if (self.external_timing and self.measurement_driver == null) {
+            self.recordTimingError(error.ExternalMeasurementUnavailable);
+            return error.ExternalMeasurementUnavailable;
+        }
+        const driver = self.measurement_driver orelse wallMeasurementDriver();
+        var scope: MeasurementScope = .{ .driver = driver };
+        routine(self.iterations, &scope) catch |err| {
+            if (scope.protocolError()) |protocol_error| {
+                self.recordTimingError(protocol_error);
+            } else {
+                self.recordTimingError(err);
+            }
+            scope.closeActive();
+            return err;
+        };
+        self.elapsed_ns = scope.finish() catch |err| {
+            self.recordTimingError(err);
+            return err;
+        };
+        self.measured = true;
     }
 
     pub fn finishCustom(self: *Bencher, elapsed_ns: u64) void {
         self.elapsed_ns = elapsed_ns;
         self.measured = true;
+        self.unscoped_custom_timing = true;
+        if (self.external_timing) {
+            self.recordTimingError(error.ExternalMeasurementRequiresScopedCustomTiming);
+        }
     }
 
     pub fn iterAsync(self: *Bencher, executor: AsyncExecutor, routine: *const fn () void) void {
         self.used_async = true;
-        const start = if (self.external_timing) 0 else nowNs();
+        const start = self.startMeasurement() orelse return;
         var i: u64 = 0;
         while (i < self.iterations) : (i += 1) executor.run(executor.ctx, routine);
-        self.elapsed_ns = if (self.external_timing) 0 else nowNs() - start;
+        self.elapsed_ns = self.endMeasurement(start) orelse return;
         self.measured = true;
     }
 
@@ -92,22 +223,57 @@ pub const Bencher = struct {
         const batches = batchCount(self.iterations, policy);
         var b: u64 = 0;
         var done: u64 = 0;
-        var total_elapsed: u64 = 0;
+        var total_elapsed = self.zeroMeasurement();
         while (b < batches and done < self.iterations) : (b += 1) {
             var input = setup();
             const batches_left = batches - b;
             const remaining = self.iterations - done;
             const this_batch = 1 + (remaining - 1) / batches_left;
-            const start = if (self.external_timing) 0 else nowNs();
+            const start = self.startMeasurement() orelse return;
             var i: u64 = 0;
             while (i < this_batch and done < self.iterations) : ({
                 i += 1;
                 done += 1;
             }) routine(&input);
-            if (!self.external_timing) total_elapsed += nowNs() - start;
+            const elapsed = self.endMeasurement(start) orelse return;
+            total_elapsed = self.addMeasurement(total_elapsed, elapsed);
         }
         self.elapsed_ns = total_elapsed;
         self.measured = true;
+    }
+
+    fn startMeasurement(self: *Bencher) ?MeasurementValue {
+        if (self.measurement_driver) |driver| {
+            return driver.start(driver.ctx) catch |err| {
+                self.recordTimingError(err);
+                return null;
+            };
+        }
+        return if (self.external_timing) 0 else nowNs();
+    }
+
+    fn endMeasurement(self: *Bencher, started: MeasurementValue) ?MeasurementValue {
+        if (self.measurement_driver) |driver| {
+            return driver.end(driver.ctx, started) catch |err| {
+                self.recordTimingError(err);
+                return null;
+            };
+        }
+        return if (self.external_timing) 0 else nowNs() - started;
+    }
+
+    fn zeroMeasurement(self: Bencher) MeasurementValue {
+        if (self.measurement_driver) |driver| return driver.zero(driver.ctx);
+        return 0;
+    }
+
+    fn addMeasurement(self: Bencher, a: MeasurementValue, b: MeasurementValue) MeasurementValue {
+        if (self.measurement_driver) |driver| return driver.add(driver.ctx, a, b);
+        return a + b;
+    }
+
+    fn recordTimingError(self: *Bencher, err: anyerror) void {
+        if (self.timing_error == null) self.timing_error = err;
     }
 };
 
@@ -242,6 +408,34 @@ fn batchCount(iterations: u64, policy: BatchPolicy) u64 {
         .num_batches => |n| @max(@as(u64, 1), @min(iterations, n)),
         .num_iterations => |n| if (iterations == 0) 0 else 1 + (iterations - 1) / @max(@as(u64, 1), n),
     };
+}
+
+var wall_driver_context: u8 = 0;
+
+fn wallMeasurementDriver() MeasurementDriver {
+    return .{
+        .ctx = &wall_driver_context,
+        .start = wallStart,
+        .end = wallEnd,
+        .zero = wallZero,
+        .add = wallAdd,
+    };
+}
+
+fn wallStart(_: *anyopaque) !MeasurementValue {
+    return nowNs();
+}
+
+fn wallEnd(_: *anyopaque, started: MeasurementValue) !MeasurementValue {
+    return nowNs() - started;
+}
+
+fn wallZero(_: *anyopaque) MeasurementValue {
+    return 0;
+}
+
+fn wallAdd(_: *anyopaque, a: MeasurementValue, b: MeasurementValue) MeasurementValue {
+    return a + b;
 }
 
 pub fn nowNs() u64 {
