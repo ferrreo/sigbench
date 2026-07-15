@@ -191,6 +191,8 @@ Sigbench supports:
 - `iterCustomScoped`: user receives iteration count and a `MeasurementScope`; setup and teardown
   run outside its explicit `start` and `stop` boundary.
 - `iterBatch`: setup outside measured region, routine inside measured region, fixed batch policy.
+- `iterBatchWithTeardown`: setup and teardown outside each measured batch, routine inside,
+  fixed batch policy.
 - `iterAsync`: executor-backed async routine loop.
 
 `iterCustomScoped` requires exactly one `start` and one `stop`. Missing, repeated, or
@@ -211,7 +213,13 @@ Every scoped routine invokes its driver's optional cleanup hook exactly once aft
 failure. This releases setup state even when a callback fails or omits `start`; cleanup itself
 does not replace the retained counter, protocol, or callback error.
 
-Skip `iter_with_large_drop` as a separate concept. Zig has explicit lifetimes and no Rust `Drop`; `iterBatch` covers the real need.
+`iterBatchWithTeardown` invokes teardown exactly once after every successful setup, including
+when measurement start or end fails. Its setup, routine, and teardown callbacks are infallible;
+a panic terminates the process and is not a recoverable routine failure. This keeps the timed
+loop allocation-free and makes per-batch filesystem or descriptor cleanup explicit.
+
+Skip `iter_with_large_drop` as a separate concept. Zig has explicit lifetimes and no Rust `Drop`;
+`iterBatchWithTeardown` covers explicit resource release.
 
 Batch policy:
 
@@ -567,7 +575,7 @@ Scope:
 - Runtime benchmark registration.
 - Benchmark groups and benchmark cases.
 - Parameterized benchmark matrix API with explicit stable parameter IDs and display labels.
-- `Bencher` timing loops: `iter`, `iterCustom`, `iterBatch`.
+- `Bencher` timing loops: `iter`, `iterCustom`, `iterBatch`, `iterBatchWithTeardown`.
 - Scoped custom timing through one explicit `MeasurementScope` start/stop pair.
 - Warmup loop with `1, 2, 4, ...` iteration growth.
 - Linear, flat, and auto sampling modes.

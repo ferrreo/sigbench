@@ -241,12 +241,36 @@ pub const Bencher = struct {
         routine: *const fn (*T) void,
         policy: BatchPolicy,
     ) void {
+        self.iterBatchInternal(T, setup, routine, null, policy);
+    }
+
+    /// Runs teardown once after every batch, outside the measured region.
+    pub fn iterBatchWithTeardown(
+        self: *Bencher,
+        comptime T: type,
+        setup: *const fn () T,
+        routine: *const fn (*T) void,
+        teardown: *const fn (*T) void,
+        policy: BatchPolicy,
+    ) void {
+        self.iterBatchInternal(T, setup, routine, teardown, policy);
+    }
+
+    fn iterBatchInternal(
+        self: *Bencher,
+        comptime T: type,
+        setup: *const fn () T,
+        routine: *const fn (*T) void,
+        teardown: ?*const fn (*T) void,
+        policy: BatchPolicy,
+    ) void {
         const batches = batchCount(self.iterations, policy);
         var b: u64 = 0;
         var done: u64 = 0;
         var total_elapsed = self.zeroMeasurement();
         while (b < batches and done < self.iterations) : (b += 1) {
             var input = setup();
+            defer if (teardown) |teardown_fn| teardown_fn(&input);
             const batches_left = batches - b;
             const remaining = self.iterations - done;
             const this_batch = 1 + (remaining - 1) / batches_left;
@@ -543,6 +567,73 @@ test "iterBatch num_iterations caps batch size" {
     S.largest = @max(S.largest, S.current);
     try std.testing.expectEqual(@as(u64, 4), S.setups);
     try std.testing.expect(S.largest <= 3);
+}
+
+test "iterBatchWithTeardown covers uneven batches" {
+    const Input = struct { routines: u8 = 0 };
+    const S = struct {
+        var setups: u64 = 0;
+        var routines: u64 = 0;
+        var teardowns: u64 = 0;
+        var batch_routines: [10]u8 = undefined;
+
+        fn setup() Input {
+            setups += 1;
+            return .{};
+        }
+
+        fn routine(input: *Input) void {
+            input.routines += 1;
+            routines += 1;
+        }
+
+        fn teardown(input: *Input) void {
+            batch_routines[teardowns] = input.routines;
+            teardowns += 1;
+        }
+    };
+    var b: Bencher = .{ .iterations = 17 };
+    b.iterBatchWithTeardown(Input, S.setup, S.routine, S.teardown, .small_input);
+    try std.testing.expectEqual(@as(u64, 10), S.setups);
+    try std.testing.expectEqual(@as(u64, 17), S.routines);
+    try std.testing.expectEqual(@as(u64, 10), S.teardowns);
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 2, 2, 2, 2, 2, 2, 2, 1, 1, 1 },
+        &S.batch_routines,
+    );
+    try std.testing.expect(b.measured);
+}
+
+test "iterBatchWithTeardown tears down every per-iteration input" {
+    const S = struct {
+        var setups: u64 = 0;
+        var routines: u64 = 0;
+        var teardowns: u64 = 0;
+        var invalid_input = false;
+
+        fn setup() u8 {
+            setups += 1;
+            return 0;
+        }
+
+        fn routine(input: *u8) void {
+            input.* += 1;
+            routines += 1;
+        }
+
+        fn teardown(input: *u8) void {
+            invalid_input = invalid_input or input.* != 1;
+            teardowns += 1;
+        }
+    };
+    var b: Bencher = .{ .iterations = 4 };
+    b.iterBatchWithTeardown(u8, S.setup, S.routine, S.teardown, .per_iteration);
+    try std.testing.expectEqual(@as(u64, 4), S.setups);
+    try std.testing.expectEqual(@as(u64, 4), S.routines);
+    try std.testing.expectEqual(@as(u64, 4), S.teardowns);
+    try std.testing.expect(!S.invalid_input);
+    try std.testing.expect(b.measured);
 }
 
 test "iterAsync routes through executor" {

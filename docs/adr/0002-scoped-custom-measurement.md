@@ -15,3 +15,6 @@ Each scope also invokes an optional driver cleanup hook exactly once. Cleanup ru
 callback failure, and protocol failure, including failures before `start`, without replacing an
 earlier driver, protocol, or callback result. Retained driver errors take precedence over later
 protocol or callback errors; driver-end cleanup errors do not replace an original callback failure.
+Batch routines that need explicit resource release use `Bencher.iterBatchWithTeardown` instead.
+It runs teardown once after every successful setup and outside measurement, including when
+measurement start or end fails; its callbacks remain infallible like `iterBatch`.

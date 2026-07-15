@@ -103,6 +103,205 @@ test "measurement driver scopes built-in timing loops" {
     try std.testing.expectEqual(@as(u64, 1), S.zeroes);
     try std.testing.expectEqual(@as(u64, 3), S.adds);
 }
+
+test "batch teardown stays outside external measurement and accumulates batches" {
+    const S = struct {
+        var context: u8 = 0;
+        var now: u64 = 0;
+        var starts: u64 = 0;
+        var ends: u64 = 0;
+        var zeroes: u64 = 0;
+        var adds: u64 = 0;
+        var teardowns: u64 = 0;
+
+        fn setup() u8 {
+            now += 100;
+            return 0;
+        }
+
+        fn routine(_: *u8) void {
+            now += 7;
+        }
+
+        fn teardown(_: *u8) void {
+            now += 200;
+            teardowns += 1;
+        }
+
+        fn start(_: *anyopaque) !u64 {
+            starts += 1;
+            return now;
+        }
+
+        fn end(_: *anyopaque, started: u64) !u64 {
+            ends += 1;
+            return now - started;
+        }
+
+        fn zero(_: *anyopaque) u64 {
+            zeroes += 1;
+            return 0;
+        }
+
+        fn add(_: *anyopaque, a: u64, b: u64) u64 {
+            adds += 1;
+            return a + b;
+        }
+    };
+    var b: Bencher = .{
+        .iterations = 5,
+        .external_timing = true,
+        .measurement_driver = .{
+            .ctx = &S.context,
+            .start = S.start,
+            .end = S.end,
+            .zero = S.zero,
+            .add = S.add,
+        },
+    };
+    b.iterBatchWithTeardown(
+        u8,
+        S.setup,
+        S.routine,
+        S.teardown,
+        .{ .num_batches = 2 },
+    );
+    try std.testing.expectEqual(@as(u64, 35), b.elapsed_ns);
+    try std.testing.expectEqual(@as(u64, 635), S.now);
+    try std.testing.expectEqual(@as(u64, 2), S.starts);
+    try std.testing.expectEqual(@as(u64, 2), S.ends);
+    try std.testing.expectEqual(@as(u64, 1), S.zeroes);
+    try std.testing.expectEqual(@as(u64, 2), S.adds);
+    try std.testing.expectEqual(@as(u64, 2), S.teardowns);
+    try std.testing.expect(b.measured);
+}
+
+test "batch teardown runs after measurement start and end failures" {
+    const StartFailure = struct {
+        var context: u8 = 0;
+        var setups: u64 = 0;
+        var routines: u64 = 0;
+        var teardowns: u64 = 0;
+        var ends: u64 = 0;
+
+        fn setup() u8 {
+            setups += 1;
+            return 0;
+        }
+
+        fn routine(_: *u8) void {
+            routines += 1;
+        }
+
+        fn teardown(_: *u8) void {
+            teardowns += 1;
+        }
+
+        fn start(_: *anyopaque) !u64 {
+            return error.StartFailure;
+        }
+
+        fn end(_: *anyopaque, _: u64) !u64 {
+            ends += 1;
+            return 0;
+        }
+
+        fn zero(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        fn add(_: *anyopaque, a: u64, b: u64) u64 {
+            return a + b;
+        }
+    };
+    var start_failure: Bencher = .{
+        .iterations = 3,
+        .external_timing = true,
+        .measurement_driver = .{
+            .ctx = &StartFailure.context,
+            .start = StartFailure.start,
+            .end = StartFailure.end,
+            .zero = StartFailure.zero,
+            .add = StartFailure.add,
+        },
+    };
+    start_failure.iterBatchWithTeardown(
+        u8,
+        StartFailure.setup,
+        StartFailure.routine,
+        StartFailure.teardown,
+        .per_iteration,
+    );
+    try std.testing.expectEqual(error.StartFailure, start_failure.timing_error.?);
+    try std.testing.expectEqual(@as(u64, 1), StartFailure.setups);
+    try std.testing.expectEqual(@as(u64, 0), StartFailure.routines);
+    try std.testing.expectEqual(@as(u64, 1), StartFailure.teardowns);
+    try std.testing.expectEqual(@as(u64, 0), StartFailure.ends);
+    try std.testing.expect(!start_failure.measured);
+
+    const EndFailure = struct {
+        var context: u8 = 0;
+        var setups: u64 = 0;
+        var routines: u64 = 0;
+        var teardowns: u64 = 0;
+        var starts: u64 = 0;
+
+        fn setup() u8 {
+            setups += 1;
+            return 0;
+        }
+
+        fn routine(_: *u8) void {
+            routines += 1;
+        }
+
+        fn teardown(_: *u8) void {
+            teardowns += 1;
+        }
+
+        fn start(_: *anyopaque) !u64 {
+            starts += 1;
+            return 0;
+        }
+
+        fn end(_: *anyopaque, _: u64) !u64 {
+            return error.EndFailure;
+        }
+
+        fn zero(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        fn add(_: *anyopaque, a: u64, b: u64) u64 {
+            return a + b;
+        }
+    };
+    var end_failure: Bencher = .{
+        .iterations = 3,
+        .external_timing = true,
+        .measurement_driver = .{
+            .ctx = &EndFailure.context,
+            .start = EndFailure.start,
+            .end = EndFailure.end,
+            .zero = EndFailure.zero,
+            .add = EndFailure.add,
+        },
+    };
+    end_failure.iterBatchWithTeardown(
+        u8,
+        EndFailure.setup,
+        EndFailure.routine,
+        EndFailure.teardown,
+        .per_iteration,
+    );
+    try std.testing.expectEqual(error.EndFailure, end_failure.timing_error.?);
+    try std.testing.expectEqual(@as(u64, 1), EndFailure.setups);
+    try std.testing.expectEqual(@as(u64, 1), EndFailure.routines);
+    try std.testing.expectEqual(@as(u64, 1), EndFailure.teardowns);
+    try std.testing.expectEqual(@as(u64, 1), EndFailure.starts);
+    try std.testing.expect(!end_failure.measured);
+}
+
 test "scoped custom timing excludes setup and teardown" {
     const S = struct {
         var context: u8 = 0;

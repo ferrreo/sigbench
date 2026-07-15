@@ -39,6 +39,7 @@ Tasks:
 - Implement `Bencher.iterCustom`.
 - Implement `Bencher.iterCustomScoped` with one explicit measurement scope.
 - Implement `Bencher.iterBatch`.
+- Implement `Bencher.iterBatchWithTeardown` for untimed explicit batch cleanup.
 - Implement warmup with `1, 2, 4, ...` iteration growth.
 - Implement linear, flat, and auto sampling modes.
 - Implement `SampleSet` as structure-of-arrays.
