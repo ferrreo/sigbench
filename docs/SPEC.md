@@ -200,6 +200,17 @@ error. `iterCustom` and `finishCustom` remain compatible for wall-clock sampling
 cycle and perf counters reject them instead of measuring surrounding setup and teardown.
 If a selected counter's `stop` fails, Sigbench returns that error without invoking `stop` again.
 
+Threaded custom routines may call `MeasurementScope.includeThread(thread_id)` during setup,
+before `start`. A driver hook error remains the scope result even when the routine catches it;
+registration at or after `start` similarly rejects the scope. Linux perf attaches one event to
+each distinct explicitly included worker and adds those values to the caller-thread event.
+Including the caller or the same worker more than once is a no-op. Wall-clock and serialized
+TSC drivers have no thread hook, so inclusion is a no-op for those kinds: wall time already
+covers waiting, while TSC remains a caller-bound timestamp rather than a worker-cycle sum.
+Every scoped routine invokes its driver's optional cleanup hook exactly once after success or
+failure. This releases setup state even when a callback fails or omits `start`; cleanup itself
+does not replace the retained counter, protocol, or callback error.
+
 Skip `iter_with_large_drop` as a separate concept. Zig has explicit lifetimes and no Rust `Drop`; `iterBatch` covers the real need.
 
 Batch policy:
@@ -257,6 +268,8 @@ Measurement API requirements:
 - `zero` and `add` support batched timing loops.
 - `toF64` provides analysis units.
 - `formatter` handles CLI, HTML, plot, and JSON units.
+- Optional `include_thread` attaches explicit worker state before a custom scope starts.
+- Optional `cleanup` releases scope-owned driver state exactly once after every scoped routine.
 
 Cycle and perf measurements must be explicit in benchmark configuration. Wall-clock remains default because it is portable.
 
@@ -271,6 +284,23 @@ accounting through `QueryThreadCycleTime`.
 Perf constraints:
 
 - Linux perf support can be Linux-only.
+- Linux perf counts userspace events only; kernel and hypervisor events stay excluded.
+- Linux perf keeps one caller-thread descriptor and supports at most 64 distinct included worker
+  threads per scope through a fixed, allocation-free table.
+- The thread that opens Linux perf owns its caller descriptor and must also call scope `start` and
+  `stop`. Start rejects another thread before enabling events; stop disables all events before
+  rejecting a changed thread, so a failed sample cannot leave counters running.
+- An included worker ID must name an existing same-process Linux thread when registered. The
+  benchmark owns that thread and keeps it alive through `MeasurementScope.stop`.
+- Linux validates process membership with `tgkill(getpid(), tid, 0)` immediately before opening
+  the worker event. Keeping the worker alive through `stop` prevents exit and numeric-ID reuse
+  from racing that check.
+- Worker registration opens descriptors before the measurement starts. Start resets and enables
+  the caller and all included workers; stop disables, reads, checked-adds, and closes every worker
+  descriptor. Any start, stop, read, registration, or sum-overflow failure rejects the sample and
+  clears its worker registrations.
+- Calls to include threads after `MeasurementScope.start` are rejected. Linux perf is explicit
+  thread aggregation, not a process-wide counter.
 - macOS kperf counter support is in first counter scope. It must be explicit, and permission/setup failures must stop before warmup.
 - Windows cycle support uses `QueryThreadCycleTime` or `QueryProcessCycleTime`.
 - Windows PMU event counters such as branch misses, cache misses, and retired instructions are not considered an easy no-runtime-deps equivalent. ETW/WPR can collect PMU events, but that is a profiling/reporting integration candidate, not a timed-loop measurement backend.
@@ -602,6 +632,7 @@ Scope:
 - Measurement interface: `start`, `end`, `zero`, `add`, `toF64`, formatter.
 - CPU cycles measurement.
 - Linux perf counters via Zig stdlib/direct syscall path, using `perf_event_open`.
+- Explicit Linux perf worker aggregation through pre-start `MeasurementScope.includeThread`.
 - macOS kperf counters using OS APIs.
 - Windows cycle counters through `QueryThreadCycleTime` or `QueryProcessCycleTime`.
 - Process memory measurements: RSS/working set, peak RSS/peak working set, Linux Proportional Set Size, private/committed memory where available.
@@ -622,7 +653,8 @@ Scope:
 Verification:
 
 - Unsupported counter test fails before warmup.
-- Linux perf setup/read tests run where available; skipped clearly where kernel/permissions block them.
+- Linux perf setup/read and live worker-aggregation tests run where available; skipped clearly
+  where kernel/permissions block them.
 - macOS kperf setup/read tests run where available; skipped clearly where platform/permissions block them.
 - Windows cycle and process-memory tests run where available.
 - Allocator counter tests verify alloc/free/resize/live/peak accounting and wrapper transparency.

@@ -37,6 +37,8 @@ pub const MeasurementDriver = struct {
     end: *const fn (*anyopaque, MeasurementValue) anyerror!MeasurementValue,
     zero: *const fn (*anyopaque) MeasurementValue,
     add: *const fn (*anyopaque, MeasurementValue, MeasurementValue) MeasurementValue,
+    include_thread: ?*const fn (*anyopaque, std.Thread.Id) anyerror!void = null,
+    cleanup: ?*const fn (*anyopaque) void = null,
 };
 
 pub const MeasurementScope = struct {
@@ -48,15 +50,28 @@ pub const MeasurementScope = struct {
     active: bool = false,
     violation: ?Violation = null,
     driver_error: ?anyerror = null,
+    cleaned_up: bool = false,
 
     const Violation = enum {
         started_twice,
         stopped_before_start,
         stopped_twice,
+        thread_included_after_start,
     };
+
+    pub fn includeThread(self: *MeasurementScope, thread_id: std.Thread.Id) !void {
+        if (self.started) return self.reject(.thread_included_after_start);
+        if (self.driver_error) |err| return err;
+        const include_thread = self.driver.include_thread orelse return;
+        include_thread(self.driver.ctx, thread_id) catch |err| {
+            self.driver_error = err;
+            return err;
+        };
+    }
 
     pub fn start(self: *MeasurementScope) !void {
         if (self.started) return self.reject(.started_twice);
+        if (self.driver_error) |err| return err;
         self.started = true;
         self.started_value = self.driver.start(self.driver.ctx) catch |err| {
             self.driver_error = err;
@@ -78,13 +93,13 @@ pub const MeasurementScope = struct {
     }
 
     fn finish(self: *MeasurementScope) !MeasurementValue {
-        if (self.violation) |violation| {
-            self.closeActive();
-            return violationError(violation);
-        }
         if (self.driver_error) |err| {
             self.closeActive();
             return err;
+        }
+        if (self.violation) |violation| {
+            self.closeActive();
+            return violationError(violation);
         }
         if (!self.started) return error.MeasurementScopeNotStarted;
         if (!self.stopped) {
@@ -104,6 +119,12 @@ pub const MeasurementScope = struct {
         };
     }
 
+    fn cleanup(self: *MeasurementScope) void {
+        if (self.cleaned_up) return;
+        self.cleaned_up = true;
+        if (self.driver.cleanup) |cleanup_driver| cleanup_driver(self.driver.ctx);
+    }
+
     fn reject(self: *MeasurementScope, violation: Violation) anyerror {
         if (self.violation == null) self.violation = violation;
         return violationError(violation);
@@ -119,6 +140,7 @@ pub const MeasurementScope = struct {
             .started_twice => error.MeasurementScopeStartedTwice,
             .stopped_before_start => error.MeasurementScopeStoppedBeforeStart,
             .stopped_twice => error.MeasurementScopeStoppedTwice,
+            .thread_included_after_start => error.MeasurementScopeThreadIncludedAfterStart,
         };
     }
 };
@@ -179,14 +201,13 @@ pub const Bencher = struct {
         }
         const driver = self.measurement_driver orelse wallMeasurementDriver();
         var scope: MeasurementScope = .{ .driver = driver };
-        routine(self.iterations, &scope) catch |err| {
-            if (scope.protocolError()) |protocol_error| {
-                self.recordTimingError(protocol_error);
-            } else {
-                self.recordTimingError(err);
-            }
+        defer scope.cleanup();
+        routine(self.iterations, &scope) catch |callback_error| {
+            const retained_error: ?anyerror = scope.driver_error orelse scope.protocolError();
             scope.closeActive();
-            return err;
+            const result_error = retained_error orelse callback_error;
+            self.recordTimingError(result_error);
+            return result_error;
         };
         self.elapsed_ns = scope.finish() catch |err| {
             self.recordTimingError(err);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const api = @import("api.zig");
 const measurement = @import("measurement.zig");
+const linux_perf = @import("linux_perf.zig");
 
 pub const SamplingMode = enum { auto, linear, flat };
 pub const MeasurementKind = enum { wall_time, cpu_cycles, linux_perf, macos_kperf, process_memory, allocator_counters };
@@ -141,8 +142,8 @@ pub fn collect(
     counts: []const u64,
     kind: MeasurementKind,
 ) !void {
-    var linux_perf = if (kind == .linux_perf) try measurement.LinuxPerf.open() else null;
-    defer if (linux_perf) |perf| perf.close();
+    var perf = if (kind == .linux_perf) try linux_perf.LinuxPerf.open() else null;
+    defer if (perf) |*value| value.close();
     var macos_kperf = if (kind == .macos_kperf) try measurement.MacosKperf.open() else null;
     defer if (macos_kperf) |kperf| kperf.close();
     var cpu_cycles: measurement.CpuCycles = .{};
@@ -155,7 +156,7 @@ pub fn collect(
         if (kind == .cpu_cycles) {
             samples.elapsed_ns[i] = try collectMeasured(case, &b, cpu_cycles.measurement());
         } else if (kind == .linux_perf) {
-            samples.elapsed_ns[i] = try collectMeasured(case, &b, linux_perf.?.measurement());
+            samples.elapsed_ns[i] = try collectMeasured(case, &b, perf.?.measurement());
         } else if (kind == .macos_kperf) {
             samples.elapsed_ns[i] = try collectMeasured(case, &b, macos_kperf.?.measurement());
         } else if (kind == .process_memory) {
@@ -196,6 +197,8 @@ fn collectMeasured(case: api.BenchmarkCase, b: *api.Bencher, m: measurement.Meas
         .end = m.end,
         .zero = m.zero,
         .add = m.add,
+        .include_thread = m.include_thread,
+        .cleanup = m.cleanup,
     };
     try case.run(b);
     if (b.timing_error) |err| return err;
@@ -366,6 +369,7 @@ test "external measurement honors scoped custom boundaries" {
         var now: u64 = 0;
         var starts: u64 = 0;
         var ends: u64 = 0;
+        var cleanups: u64 = 0;
 
         fn bench(b: *api.Bencher) !void {
             now += 100;
@@ -407,6 +411,10 @@ test "external measurement honors scoped custom boundaries" {
         fn format(_: *anyopaque, allocator: std.mem.Allocator, value: measurement.MeasurementValue) ![]u8 {
             return std.fmt.allocPrint(allocator, "{}", .{value});
         }
+
+        fn cleanup(_: *anyopaque) void {
+            cleanups += 1;
+        }
     };
     var ctx: u8 = 0;
     var b: api.Bencher = .{ .iterations = 3, .external_timing = true };
@@ -419,10 +427,12 @@ test "external measurement honors scoped custom boundaries" {
         .add = S.add,
         .toF64 = S.toF64,
         .format = S.format,
+        .cleanup = S.cleanup,
     });
     try std.testing.expectEqual(@as(f64, 21), elapsed);
     try std.testing.expectEqual(@as(u64, 1), S.starts);
     try std.testing.expectEqual(@as(u64, 1), S.ends);
+    try std.testing.expectEqual(@as(u64, 1), S.cleanups);
 }
 
 test "external measurement rejects legacy custom timing" {

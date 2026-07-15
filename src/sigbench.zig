@@ -50,4 +50,5 @@ test {
     _ = analysis;
     _ = @import("x86_cycles.zig");
     _ = @import("measurement.zig");
+    _ = @import("linux_perf.zig");
 }

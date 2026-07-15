@@ -154,6 +154,265 @@ test "scoped custom timing excludes setup and teardown" {
     try std.testing.expectEqual(@as(u64, 1), S.ends);
 }
 
+test "scoped custom timing registers threads before start" {
+    const S = struct {
+        var context: u8 = 0;
+        var included: [2]std.Thread.Id = undefined;
+        var included_count: usize = 0;
+        var cleanups: usize = 0;
+
+        fn includeThread(_: *anyopaque, thread_id: std.Thread.Id) !void {
+            included[included_count] = thread_id;
+            included_count += 1;
+        }
+
+        fn start(_: *anyopaque) !u64 {
+            return 1;
+        }
+
+        fn end(_: *anyopaque, _: u64) !u64 {
+            return 2;
+        }
+
+        fn zero(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        fn add(_: *anyopaque, a: u64, b: u64) u64 {
+            return a + b;
+        }
+
+        fn cleanup(_: *anyopaque) void {
+            cleanups += 1;
+        }
+
+        fn run(_: u64, scope: *MeasurementScope) !void {
+            try scope.includeThread(11);
+            try scope.includeThread(22);
+            try scope.start();
+            try scope.stop();
+        }
+    };
+    var b: Bencher = .{ .measurement_driver = .{
+        .ctx = &S.context,
+        .start = S.start,
+        .end = S.end,
+        .zero = S.zero,
+        .add = S.add,
+        .include_thread = S.includeThread,
+        .cleanup = S.cleanup,
+    } };
+    try b.iterCustomScoped(S.run);
+    try std.testing.expectEqualSlices(
+        std.Thread.Id,
+        &.{ 11, 22 },
+        S.included[0..S.included_count],
+    );
+    try std.testing.expectEqual(@as(usize, 1), S.cleanups);
+}
+
+test "scoped custom timing thread hook is optional" {
+    const S = struct {
+        fn run(_: u64, scope: *MeasurementScope) !void {
+            try scope.includeThread(std.Thread.getCurrentId());
+            try scope.start();
+            try scope.stop();
+        }
+    };
+    var b: Bencher = .{};
+    try b.iterCustomScoped(S.run);
+    try std.testing.expect(b.measured);
+}
+
+const CleanupDriver = struct {
+    var context: u8 = 0;
+    var registered = false;
+    var cleanups: usize = 0;
+    var starts: usize = 0;
+    var ends: usize = 0;
+
+    fn reset() void {
+        registered = false;
+        cleanups = 0;
+        starts = 0;
+        ends = 0;
+    }
+
+    fn driver() MeasurementDriver {
+        return .{
+            .ctx = &context,
+            .start = start,
+            .end = end,
+            .zero = zero,
+            .add = add,
+            .include_thread = includeThread,
+            .cleanup = cleanup,
+        };
+    }
+
+    fn includeThread(_: *anyopaque, _: std.Thread.Id) !void {
+        if (registered) return error.StaleThreadRegistration;
+        registered = true;
+    }
+
+    fn cleanup(_: *anyopaque) void {
+        registered = false;
+        cleanups += 1;
+    }
+
+    fn start(_: *anyopaque) !u64 {
+        starts += 1;
+        return 0;
+    }
+
+    fn end(_: *anyopaque, _: u64) !u64 {
+        ends += 1;
+        return 1;
+    }
+
+    fn zero(_: *anyopaque) u64 {
+        return 0;
+    }
+
+    fn add(_: *anyopaque, a: u64, b: u64) u64 {
+        return a + b;
+    }
+
+    fn callbackFailure(_: u64, scope: *MeasurementScope) !void {
+        try scope.includeThread(11);
+        return error.CallbackFailure;
+    }
+
+    fn missingStart(_: u64, scope: *MeasurementScope) !void {
+        try scope.includeThread(11);
+    }
+
+    fn valid(_: u64, scope: *MeasurementScope) !void {
+        try scope.includeThread(11);
+        try scope.start();
+        try scope.stop();
+    }
+};
+
+test "scoped custom timing cleans pre-start registrations and permits reuse" {
+    CleanupDriver.reset();
+    var callback_failure: Bencher = .{ .measurement_driver = CleanupDriver.driver() };
+    try std.testing.expectError(
+        error.CallbackFailure,
+        callback_failure.iterCustomScoped(CleanupDriver.callbackFailure),
+    );
+    try std.testing.expect(!CleanupDriver.registered);
+    try std.testing.expectEqual(@as(usize, 1), CleanupDriver.cleanups);
+
+    var missing_start: Bencher = .{ .measurement_driver = CleanupDriver.driver() };
+    try std.testing.expectError(
+        error.MeasurementScopeNotStarted,
+        missing_start.iterCustomScoped(CleanupDriver.missingStart),
+    );
+    try std.testing.expect(!CleanupDriver.registered);
+    try std.testing.expectEqual(@as(usize, 2), CleanupDriver.cleanups);
+
+    var valid: Bencher = .{ .measurement_driver = CleanupDriver.driver() };
+    try valid.iterCustomScoped(CleanupDriver.valid);
+    try std.testing.expect(!CleanupDriver.registered);
+    try std.testing.expectEqual(@as(usize, 3), CleanupDriver.cleanups);
+    try std.testing.expectEqual(@as(usize, 1), CleanupDriver.starts);
+    try std.testing.expectEqual(@as(usize, 1), CleanupDriver.ends);
+}
+
+test "scoped custom timing rejects thread registration after start" {
+    const S = struct {
+        var context: u8 = 0;
+        var ends: u64 = 0;
+
+        fn start(_: *anyopaque) !u64 {
+            return 0;
+        }
+
+        fn end(_: *anyopaque, _: u64) !u64 {
+            ends += 1;
+            return 1;
+        }
+
+        fn zero(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        fn add(_: *anyopaque, a: u64, b: u64) u64 {
+            return a + b;
+        }
+
+        fn run(_: u64, scope: *MeasurementScope) !void {
+            try scope.start();
+            scope.includeThread(11) catch {};
+            try scope.stop();
+        }
+    };
+    var b: Bencher = .{ .measurement_driver = .{
+        .ctx = &S.context,
+        .start = S.start,
+        .end = S.end,
+        .zero = S.zero,
+        .add = S.add,
+    } };
+    try std.testing.expectError(
+        error.MeasurementScopeThreadIncludedAfterStart,
+        b.iterCustomScoped(S.run),
+    );
+    try std.testing.expectEqual(error.MeasurementScopeThreadIncludedAfterStart, b.timing_error.?);
+    try std.testing.expectEqual(@as(u64, 1), S.ends);
+}
+
+test "scoped custom timing persists caught thread hook errors" {
+    const S = struct {
+        var context: u8 = 0;
+        var includes: u64 = 0;
+        var starts: u64 = 0;
+
+        fn includeThread(_: *anyopaque, _: std.Thread.Id) !void {
+            includes += 1;
+            return error.ThreadRegistrationFailure;
+        }
+
+        fn start(_: *anyopaque) !u64 {
+            starts += 1;
+            return 0;
+        }
+
+        fn end(_: *anyopaque, _: u64) !u64 {
+            return 1;
+        }
+
+        fn zero(_: *anyopaque) u64 {
+            return 0;
+        }
+
+        fn add(_: *anyopaque, a: u64, b: u64) u64 {
+            return a + b;
+        }
+
+        fn run(_: u64, scope: *MeasurementScope) !void {
+            scope.includeThread(11) catch {};
+            scope.includeThread(22) catch {};
+            scope.start() catch {};
+            scope.stop() catch {};
+            return error.CallbackFailure;
+        }
+    };
+    var b: Bencher = .{ .measurement_driver = .{
+        .ctx = &S.context,
+        .start = S.start,
+        .end = S.end,
+        .zero = S.zero,
+        .add = S.add,
+        .include_thread = S.includeThread,
+    } };
+    try std.testing.expectError(error.ThreadRegistrationFailure, b.iterCustomScoped(S.run));
+    try std.testing.expectEqual(error.ThreadRegistrationFailure, b.timing_error.?);
+    try std.testing.expectEqual(@as(u64, 1), S.includes);
+    try std.testing.expectEqual(@as(u64, 0), S.starts);
+}
+
 test "scoped custom timing rejects missing and repeated boundaries" {
     const S = struct {
         var context: u8 = 0;

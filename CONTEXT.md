@@ -41,6 +41,11 @@ Explicit start and stop boundary inside a custom timing routine. Setup and teard
 the selected measurement kind.
 _Avoid_: Timer when the selected measurement may be a hardware counter
 
+**Included Thread**:
+Existing worker thread whose userspace hardware events are added to a Linux perf measurement
+scope through `MeasurementScope.includeThread` before the scope starts.
+_Avoid_: Process counter; implicit worker
+
 **Resident Set Size**:
 Process memory currently resident in physical memory. Platform APIs name this differently; Windows calls the closest process-level value working set.
 _Avoid_: RSS when discussing Windows API names

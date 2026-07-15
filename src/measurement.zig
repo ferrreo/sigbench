@@ -2,18 +2,11 @@ const std = @import("std");
 const api = @import("api.zig");
 const builtin = @import("builtin");
 const x86_cycles = @import("x86_cycles.zig");
+const linux_perf = @import("linux_perf.zig");
 
 pub const MeasurementValue = api.MeasurementValue;
-
-pub const Measurement = struct {
-    ctx: *anyopaque,
-    start: *const fn (*anyopaque) anyerror!MeasurementValue,
-    end: *const fn (*anyopaque, MeasurementValue) anyerror!MeasurementValue,
-    zero: *const fn (*anyopaque) MeasurementValue,
-    add: *const fn (*anyopaque, MeasurementValue, MeasurementValue) MeasurementValue,
-    toF64: *const fn (*anyopaque, MeasurementValue) f64,
-    format: *const fn (*anyopaque, std.mem.Allocator, MeasurementValue) anyerror![]u8,
-};
+pub const Measurement = @import("measurement_types.zig").Measurement;
+pub const LinuxPerf = linux_perf.LinuxPerf;
 
 pub fn unitLabel(kind: anytype) []const u8 {
     return switch (kind) {
@@ -157,92 +150,6 @@ pub const CpuCycles = struct {
     fn format(ctx: *anyopaque, allocator: std.mem.Allocator, value: MeasurementValue) ![]u8 {
         _ = ctx;
         return std.fmt.allocPrint(allocator, "{} cycles", .{value});
-    }
-};
-
-pub const LinuxPerf = struct {
-    fd: std.os.linux.fd_t,
-
-    pub fn measurement(self: *LinuxPerf) Measurement {
-        return .{
-            .ctx = self,
-            .start = start,
-            .end = end,
-            .zero = zero,
-            .add = add,
-            .toF64 = toF64,
-            .format = format,
-        };
-    }
-
-    pub fn open() !LinuxPerf {
-        if (builtin.os.tag != .linux) return error.UnsupportedMeasurement;
-        var attr: std.os.linux.perf_event_attr = .{
-            .type = .HARDWARE,
-            .config = @intFromEnum(std.os.linux.PERF.COUNT.HW.CPU_CYCLES),
-        };
-        attr.flags.disabled = true;
-        attr.flags.exclude_kernel = true;
-        attr.flags.exclude_hv = true;
-        const fd = try std.posix.perf_event_open(&attr, 0, -1, -1, std.os.linux.PERF.FLAG.FD_CLOEXEC);
-        return .{ .fd = fd };
-    }
-
-    pub fn close(self: LinuxPerf) void {
-        _ = std.os.linux.close(self.fd);
-    }
-
-    fn start(ctx: *anyopaque) !MeasurementValue {
-        const self: *LinuxPerf = @ptrCast(@alignCast(ctx));
-        try self.ioctl(std.os.linux.PERF.EVENT_IOC.RESET);
-        try self.ioctl(std.os.linux.PERF.EVENT_IOC.ENABLE);
-        return 0;
-    }
-
-    fn end(ctx: *anyopaque, started: MeasurementValue) !MeasurementValue {
-        _ = started;
-        const self: *LinuxPerf = @ptrCast(@alignCast(ctx));
-        try self.ioctl(std.os.linux.PERF.EVENT_IOC.DISABLE);
-        return try self.read();
-    }
-
-    fn zero(ctx: *anyopaque) MeasurementValue {
-        _ = ctx;
-        return 0;
-    }
-
-    fn add(ctx: *anyopaque, a: MeasurementValue, b: MeasurementValue) MeasurementValue {
-        _ = ctx;
-        return a + b;
-    }
-
-    fn toF64(ctx: *anyopaque, value: MeasurementValue) f64 {
-        _ = ctx;
-        return @floatFromInt(value);
-    }
-
-    fn format(ctx: *anyopaque, allocator: std.mem.Allocator, value: MeasurementValue) ![]u8 {
-        _ = ctx;
-        return std.fmt.allocPrint(allocator, "{} events", .{value});
-    }
-
-    fn read(self: LinuxPerf) !u64 {
-        var buffer: [@sizeOf(u64)]u8 = undefined;
-        const rc = std.os.linux.read(self.fd, &buffer, buffer.len);
-        const n = switch (std.os.linux.errno(rc)) {
-            .SUCCESS => rc,
-            else => return error.InvalidPerfRead,
-        };
-        if (n != buffer.len) return error.InvalidPerfRead;
-        return std.mem.readInt(u64, &buffer, builtin.cpu.arch.endian());
-    }
-
-    fn ioctl(self: LinuxPerf, request: u32) !void {
-        const rc = std.os.linux.ioctl(self.fd, request, 0);
-        switch (std.os.linux.errno(rc)) {
-            .SUCCESS => {},
-            else => return error.PerfIoctlFailed,
-        }
     }
 };
 
@@ -448,7 +355,7 @@ pub fn preflight(kind: anytype, allocator: std.mem.Allocator, io: std.Io) !void 
         .wall_time => {},
         .cpu_cycles => _ = try CpuCycles.read(),
         .linux_perf => {
-            const perf = try LinuxPerf.open();
+            var perf = try LinuxPerf.open();
             perf.close();
         },
         .macos_kperf => {
@@ -707,16 +614,6 @@ test "macos kperf opens where supported" {
     if (!builtin.os.tag.isDarwin()) return error.SkipZigTest;
     const kperf = MacosKperf.open() catch return error.SkipZigTest;
     defer kperf.close();
-}
-
-test "linux perf opens where supported" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-    var perf = LinuxPerf.open() catch return error.SkipZigTest;
-    defer perf.close();
-    const m = perf.measurement();
-    const formatted = try m.format(m.ctx, std.testing.allocator, 3);
-    defer std.testing.allocator.free(formatted);
-    try std.testing.expectEqualStrings("3 events", formatted);
 }
 
 test "counting allocator tracks alloc free and shrink" {

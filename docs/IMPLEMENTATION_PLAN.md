@@ -105,6 +105,12 @@ Tasks:
 - Implement CPU cycles measurement.
 - Serialize x86 cycle boundaries; require invariant TSC; reject migration and backwards TSC.
 - Implement Linux perf counters through `perf_event_open`.
+- Add pre-start `MeasurementScope.includeThread(std.Thread.Id)` registration.
+- Add one-shot scope cleanup so pre-start failure cannot retain driver state.
+- Aggregate Linux perf caller and explicit worker userspace cycles with a fixed 64-worker table.
+- Deduplicate caller/worker IDs and close worker descriptors after every sample and error.
+- Validate each included TID belongs to the current process before attaching perf.
+- Reject Linux perf start/stop on a thread other than the descriptor-opening caller.
 - Implement macOS kperf counters.
 - Implement Windows cycles through `QueryThreadCycleTime` or `QueryProcessCycleTime`.
 - Implement process memory counters:
@@ -132,6 +138,11 @@ Verification:
 
 - Unsupported counters fail before warmup.
 - Linux perf tests run where supported and skip clearly where blocked.
+- Injected scope tests cover optional hooks, registration ordering, and retained hook errors.
+- Cleanup tests cover callback failure before start, missing start, success, and clean reuse.
+- Live Linux perf tests compare explicit worker aggregation with a main-thread-only control,
+  exercise deduplication, and prove descriptor-table reuse after stop.
+- Thread-affinity tests cover wrong-thread start, wrong-thread end cleanup, and caller reuse.
 - macOS kperf tests run where supported and skip clearly where blocked.
 - Windows cycles/memory tests run where supported.
 - Allocator counter tests cover alloc/free/resize/live/peak accounting and wrapper transparency.
